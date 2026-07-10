@@ -5,10 +5,13 @@ CREATE TABLE IF NOT EXISTS port_stats_queue
 (
     ts            UInt32,
     host          String,
+    region_name   String,
     instance_uuid UUID,
     port_uuid     UUID,
+    network_uuid  UUID,
     rx            UInt64,
-    tx            UInt64
+    tx            UInt64,
+    is_baseline   Bool DEFAULT false
 )
 ENGINE = Kafka
 SETTINGS
@@ -28,24 +31,30 @@ CREATE TABLE IF NOT EXISTS port_samples
 (
     ts            DateTime CODEC(Delta, ZSTD),
     host          LowCardinality(String),
+    region_name   LowCardinality(String),
     instance_uuid UUID,
     port_uuid     UUID,
+    network_uuid  UUID,
     rx            UInt64 CODEC(ZSTD),
-    tx            UInt64 CODEC(ZSTD)
+    tx            UInt64 CODEC(ZSTD),
+    is_baseline   Bool
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
-ORDER BY (instance_uuid, port_uuid, ts)
+ORDER BY (region_name, instance_uuid, port_uuid, ts)
 TTL ts + INTERVAL 6 HOUR;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS port_samples_mv TO port_samples AS
 SELECT
     toDateTime(ts)  AS ts,
     host,
+    region_name,
     instance_uuid,
     port_uuid,
+    network_uuid,
     rx,
-    tx
+    tx,
+    is_baseline
 FROM port_stats_queue;
 
 -- ============================================================
@@ -63,16 +72,18 @@ FROM port_stats_queue;
 CREATE TABLE IF NOT EXISTS port_volume_hourly
 (
     hour          DateTime,
+    region_name   LowCardinality(String),
     instance_uuid UUID,
     port_uuid     UUID,
+    network_uuid  UUID,
     rx_bytes      UInt64,
     tx_bytes      UInt64,
     samples       UInt32
 )
 ENGINE = ReplacingMergeTree(samples)
 PARTITION BY toYYYYMM(hour)
-ORDER BY (instance_uuid, port_uuid, hour)
-TTL hour + INTERVAL 13 MONTH;
+ORDER BY (region_name, instance_uuid, port_uuid, network_uuid, hour)
+TTL hour + INTERVAL 3 MONTH;
 
 -- Hour-close job: recomputes the last 3 closed hours every refresh
 -- (idempotent: same input -> same row; ReplacingMergeTree dedupes).
@@ -86,32 +97,40 @@ REFRESH EVERY 10 MINUTE APPEND TO port_volume_hourly AS
 WITH toStartOfHour(now()) AS cur_hour
 SELECT
     toStartOfHour(ts) AS hour,
+    region_name,
     instance_uuid,
     port_uuid,
-    sum(if(rx < p_rx, rx, toUInt64(rx - p_rx))) AS rx_bytes,
-    sum(if(tx < p_tx, tx, toUInt64(tx - p_tx))) AS tx_bytes,
+    network_uuid,
+    sum(if(is_baseline, 0, if(rx < p_rx, rx, toUInt64(rx - p_rx)))) AS rx_bytes,
+    sum(if(is_baseline, 0, if(tx < p_tx, tx, toUInt64(tx - p_tx)))) AS tx_bytes,
     toUInt32(count()) AS samples
 FROM
 (
     SELECT
+        region_name,
         instance_uuid,
         port_uuid,
-        ts, rx, tx,
+        ts, network_uuid, rx, tx, is_baseline,
         lagInFrame(rx, 1, toUInt64(0)) OVER w AS p_rx,
         lagInFrame(tx, 1, toUInt64(0)) OVER w AS p_tx
     FROM
     (
         -- max() collapses same-second duplicates (agent bursts, Kafka
         -- redelivery) so the window order below is deterministic
-        SELECT instance_uuid, port_uuid, ts, max(rx) AS rx, max(tx) AS tx
+        SELECT
+            region_name, instance_uuid, port_uuid, ts,
+            max(network_uuid) AS network_uuid,
+            max(rx) AS rx,
+            max(tx) AS tx,
+            max(is_baseline) AS is_baseline
         FROM port_samples
         WHERE ts >= cur_hour - INTERVAL 4 HOUR
-        GROUP BY instance_uuid, port_uuid, ts
+        GROUP BY region_name, instance_uuid, port_uuid, ts
     )
-    WINDOW w AS (PARTITION BY port_uuid ORDER BY ts)
+    WINDOW w AS (PARTITION BY region_name, port_uuid ORDER BY ts)
 )
 WHERE ts >= cur_hour - INTERVAL 3 HOUR AND ts < cur_hour
-GROUP BY hour, instance_uuid, port_uuid;
+GROUP BY hour, region_name, instance_uuid, port_uuid, network_uuid;
 
 -- ============================================================
 -- 4. Period-to-date usage, fresh to the last agent poll.
@@ -127,35 +146,42 @@ CREATE OR REPLACE VIEW port_usage AS
 WITH
     (SELECT max(hour) + INTERVAL 1 HOUR FROM port_volume_hourly) AS watermark
 SELECT
+    region_name,
     instance_uuid,
     port_uuid,
+    network_uuid,
     sum(rx)  AS rx_bytes,
     sum(tx)  AS tx_bytes,
     max(f)   AS fresh_as_of
 FROM
 (
-    SELECT instance_uuid, port_uuid, rx_bytes AS rx, tx_bytes AS tx, hour AS f
+    SELECT
+        region_name, instance_uuid, port_uuid, network_uuid,
+        rx_bytes AS rx, tx_bytes AS tx, hour AS f
     FROM port_volume_hourly FINAL
     WHERE hour >= {period_start:DateTime}
 
     UNION ALL
 
     SELECT
+        region_name,
         instance_uuid,
         port_uuid,
-        if(ts >= watermark AND ts >= {period_start:DateTime},
+        network_uuid,
+        if(ts >= watermark AND ts >= {period_start:DateTime} AND NOT is_baseline,
            if(rx < p_rx, rx, toUInt64(rx - p_rx)), 0) AS rx,
-        if(ts >= watermark AND ts >= {period_start:DateTime},
+        if(ts >= watermark AND ts >= {period_start:DateTime} AND NOT is_baseline,
            if(tx < p_tx, tx, toUInt64(tx - p_tx)), 0) AS tx,
         ts AS f
     FROM
     (
         SELECT
+            region_name,
             instance_uuid,
             port_uuid,
-            ts, rx, tx,
-            -- default 0: a port's first-ever point counts in full,
-            -- same as the counter-reset rule (rx < p_rx)
+            ts, network_uuid, rx, tx, is_baseline,
+            -- A baseline establishes the first counter predecessor after an
+            -- agent starts, but its delta is excluded above.
             lagInFrame(rx, 1, toUInt64(0)) OVER w AS p_rx,
             lagInFrame(tx, 1, toUInt64(0)) OVER w AS p_tx
         FROM
@@ -164,12 +190,17 @@ FROM
             -- baseline counter; those rows are excluded from the sum by
             -- the ts >= watermark filter above. max() collapses
             -- same-second duplicates so the window order is deterministic.
-            SELECT instance_uuid, port_uuid, ts, max(rx) AS rx, max(tx) AS tx
+            SELECT
+                region_name, instance_uuid, port_uuid, ts,
+                max(network_uuid) AS network_uuid,
+                max(rx) AS rx,
+                max(tx) AS tx,
+                max(is_baseline) AS is_baseline
             FROM port_samples
             WHERE ts >= watermark - INTERVAL 1 HOUR
-            GROUP BY instance_uuid, port_uuid, ts
+            GROUP BY region_name, instance_uuid, port_uuid, ts
         )
-        WINDOW w AS (PARTITION BY port_uuid ORDER BY ts)
+        WINDOW w AS (PARTITION BY region_name, port_uuid ORDER BY ts)
     )
 )
-GROUP BY instance_uuid, port_uuid;
+GROUP BY region_name, instance_uuid, port_uuid, network_uuid;

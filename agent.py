@@ -15,6 +15,7 @@ from confluent_kafka import Producer
 
 BROKER = "localhost:9092"
 TOPIC = "port-stats"
+REGION_NAME = "poc-region-1"
 INTERVAL = 60            # seconds between polls (prod: 60)
 NUM_PORTS = 40_000      # 1 port per instance
 NUM_HOSTS = 200         # simulated hypervisors
@@ -25,6 +26,7 @@ FLEET = [
     (
         f"aaaaaaaa-0000-4000-8000-{i:012x}",
         f"bbbbbbbb-0000-4000-8000-{i:012x}",
+        f"cccccccc-0000-4000-8000-{i % 20:012x}",
         f"poc-compute-{i % NUM_HOSTS:03d}",
     )
     for i in range(NUM_PORTS)
@@ -34,14 +36,14 @@ FLEET = [
 def main():
     producer = Producer({"bootstrap.servers": BROKER, "linger.ms": 50})
     counters = [[0, 0] for _ in range(NUM_PORTS)]
-    print(f"{NUM_PORTS} ports / {NUM_PORTS // 2} instances / {NUM_HOSTS} hosts "
+    print(f"{NUM_PORTS} ports / {NUM_PORTS} instances / {NUM_HOSTS} hosts "
           f"-> {TOPIC} @ {BROKER}, every {INTERVAL}s")
 
     while True:
         start = time.time()
         now = int(start)
         resets = 0
-        for i, (instance_uuid, port_uuid, host) in enumerate(FLEET):
+        for i, (instance_uuid, port_uuid, network_uuid, host) in enumerate(FLEET):
             c = counters[i]
             if random.random() < RESET_CHANCE:
                 c[0] = c[1] = 0
@@ -57,10 +59,13 @@ def main():
                         value=json.dumps({
                             "ts": now,
                             "host": host,
+                            "region_name": REGION_NAME,
                             "instance_uuid": instance_uuid,
                             "port_uuid": port_uuid,
+                            "network_uuid": network_uuid,
                             "rx": c[0],
                             "tx": c[1],
+                            "is_baseline": False,
                         }).encode(),
                     )
                     break
