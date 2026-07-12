@@ -1,3 +1,6 @@
 data/
 .claude
 AGENTS.md
+__pycache__/
+*.py[cod]
+.venv/

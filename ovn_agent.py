@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PoC compute-node traffic agent for ML2/OVN.
+"""PoC compute-node metrics agent for ML2/OVN.
 
 Reads bulk per-vNIC counters from libvirt, obtains the Neutron port UUID from
 the domain XML or the OVN tap-name convention, and resolves active ports in
@@ -8,8 +8,9 @@ OVN Northbound:
     Logical_Switch_Port.name == port UUID
     external_ids["neutron:network_name"] == neutron-<network UUID>
 
-Each poll reports the reset-aware traffic delta since the prior poll. The first
-observation of an interface is a zero-value baseline.
+The same bulk libvirt query also collects instance CPU/RAM gauges and per-disk
+I/O counters. Each counter family marks its first observation as a baseline so
+ClickHouse can calculate restart- and reset-aware hourly usage.
 """
 
 from __future__ import annotations
@@ -48,10 +49,50 @@ class VNICSample:
 
 
 @dataclass(frozen=True)
+class InstanceSample:
+    instance_uuid: str
+    cpu_time_ns: int
+    vcpus: int
+    memory_actual_bytes: int | None
+    memory_rss_bytes: int | None
+    memory_usable_bytes: int | None
+
+
+@dataclass(frozen=True)
+class PreviousCPU:
+    cpu_time_ns: int
+    ts: float
+
+
+@dataclass(frozen=True)
+class DiskSample:
+    instance_uuid: str
+    device: str
+    read_bytes: int | None
+    write_bytes: int | None
+    read_requests: int | None
+    write_requests: int | None
+    capacity_bytes: int | None
+    allocation_bytes: int | None
+    physical_bytes: int | None
+
+
+@dataclass(frozen=True)
+class CollectionBatch:
+    vnics: list[VNICSample]
+    instances: list[InstanceSample]
+    disks: list[DiskSample]
+
+
+@dataclass(frozen=True)
 class CycleResult:
     emitted: int
     skipped: int
     baselines: int
+    instances: int
+    instance_baselines: int
+    disks: int
+    disk_baselines: int
     discovery_seconds: float
     resolution_seconds: float
 
@@ -74,8 +115,28 @@ def parse_args() -> argparse.Namespace:
         help="Kafka bootstrap servers (default: %(default)s)",
     )
     parser.add_argument(
+        "--sasl-username",
+        default=os.getenv("KAFKA_SASL_USERNAME"),
+        help="SASL username for Kafka/Redpanda authentication",
+    )
+    parser.add_argument(
+        "--sasl-password",
+        default=os.getenv("KAFKA_SASL_PASSWORD"),
+        help="SASL password for Kafka/Redpanda authentication",
+    )
+    parser.add_argument(
         "--topic", default=os.getenv("KAFKA_TOPIC", "port-stats"),
-        help="Kafka topic (default: %(default)s)",
+        help="Kafka port-statistics topic (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--instance-topic",
+        default=os.getenv("KAFKA_INSTANCE_TOPIC", "instance-stats"),
+        help="Kafka CPU/RAM topic (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--disk-topic",
+        default=os.getenv("KAFKA_DISK_TOPIC", "disk-stats"),
+        help="Kafka per-disk statistics topic (default: %(default)s)",
     )
     parser.add_argument(
         "--interval", type=float, default=float(os.getenv("POLL_INTERVAL", "10")),
@@ -139,7 +200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--publish-kafka",
         action="store_true",
-        help="Also publish cumulative samples to Kafka for the ClickHouse pipeline",
+        help="Publish port, instance, and disk samples to Kafka for ClickHouse",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -175,8 +236,9 @@ class OVSDBClients:
                 stream.Stream.ssl_set_private_key_file(args.ovsdb_private_key)
                 stream.Stream.ssl_set_certificate_file(args.ovsdb_certificate)
                 stream.Stream.ssl_set_ca_cert_file(args.ovsdb_ca_cert)
+            nb_conn = self._resolve_to_ipv4(args.ovn_nb_db)
             nb_idl = connection.OvsdbIdl.from_server(
-                args.ovn_nb_db,
+                nb_conn,
                 "OVN_Northbound",
                 helper_tables=["Logical_Switch_Port"],
                 leader_only=False,
@@ -186,6 +248,18 @@ class OVSDBClients:
             )
         except Exception as err:
             raise CommandError(f"cannot connect to OVN NBDB: {err}") from err
+
+    @staticmethod
+    def _resolve_to_ipv4(conn_str: str) -> str:
+        import re
+        def _replace(m):
+            proto, host, port = m.group(1), m.group(2), m.group(3)
+            try:
+                ip = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+                return f"{proto}:{ip}:{port}"
+            except socket.gaierror:
+                return m.group(0)
+        return re.sub(r'(tcp|ssl):([^:,]+):(\d+)', _replace, conn_str)
 
     def find_lsp(self, port_uuid: str) -> list[dict[str, Any]]:
         try:
@@ -267,6 +341,11 @@ def as_counter(value: Any) -> int | None:
     return counter if counter >= 0 else None
 
 
+def kib_to_bytes(value: Any) -> int | None:
+    counter = as_counter(value)
+    return None if counter is None else counter * 1024
+
+
 class OVNResolver:
     def __init__(self, ovsdb: OVSDBClients):
         self.ovsdb = ovsdb
@@ -312,7 +391,7 @@ class OVNResolver:
 
 
 class LibvirtCollector:
-    """Bulk vNIC counters plus a cache of libvirt XML interface IDs."""
+    """Bulk domain metrics plus a cache of libvirt XML interface IDs."""
 
     def __init__(self, args: argparse.Namespace, ovsdb: OVSDBClients):
         self.args = args
@@ -365,11 +444,11 @@ class LibvirtCollector:
             ) from err
         return authname, password
 
-    def read(self) -> list[VNICSample]:
+    def read(self) -> CollectionBatch:
         try:
             import libvirt
         except ImportError as err:
-            raise CommandError("install python3-libvirt to collect libvirt vNIC metrics") from err
+            raise CommandError("install python3-libvirt to collect libvirt metrics") from err
 
         try:
             connection = self._open_connection(libvirt)
@@ -379,17 +458,62 @@ class LibvirtCollector:
             raise CommandError(f"cannot open libvirt URI {self.args.libvirt_uri}")
 
         try:
+            stat_groups = (
+                libvirt.VIR_DOMAIN_STATS_CPU_TOTAL
+                | libvirt.VIR_DOMAIN_STATS_VCPU
+                | libvirt.VIR_DOMAIN_STATS_BALLOON
+                | libvirt.VIR_DOMAIN_STATS_BLOCK
+                | libvirt.VIR_DOMAIN_STATS_INTERFACE
+            )
             records = connection.getAllDomainStats(
-                libvirt.VIR_DOMAIN_STATS_INTERFACE,
+                stat_groups,
                 libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_RUNNING,
             )
             pending: list[tuple[Any, str, str, int, int]] = []
+            instances: list[InstanceSample] = []
+            disks: list[DiskSample] = []
             active_keys: set[tuple[str, str]] = set()
             for domain, stats in records:
                 instance_uuid = as_uuid(domain.UUIDString())
                 if instance_uuid is None:
                     LOG.warning("skipping libvirt domain with invalid UUID")
                     continue
+
+                cpu_time_ns = as_counter(stats.get("cpu.time"))
+                if cpu_time_ns is None:
+                    LOG.warning("skipping instance metrics without cpu.time for %s", instance_uuid)
+                else:
+                    instances.append(
+                        InstanceSample(
+                            instance_uuid=instance_uuid,
+                            cpu_time_ns=cpu_time_ns,
+                            vcpus=as_counter(stats.get("vcpu.current")) or 0,
+                            memory_actual_bytes=kib_to_bytes(stats.get("balloon.current")),
+                            memory_rss_bytes=kib_to_bytes(stats.get("balloon.rss")),
+                            memory_usable_bytes=kib_to_bytes(stats.get("balloon.usable")),
+                        )
+                    )
+
+                block_count = as_counter(stats.get("block.count")) or 0
+                for index in range(block_count):
+                    device = stats.get(f"block.{index}.name")
+                    if not isinstance(device, str) or not device:
+                        LOG.debug("disk %d on %s has no stable device name", index, instance_uuid)
+                        continue
+                    disks.append(
+                        DiskSample(
+                            instance_uuid=instance_uuid,
+                            device=device,
+                            read_bytes=as_counter(stats.get(f"block.{index}.rd.bytes")),
+                            write_bytes=as_counter(stats.get(f"block.{index}.wr.bytes")),
+                            read_requests=as_counter(stats.get(f"block.{index}.rd.reqs")),
+                            write_requests=as_counter(stats.get(f"block.{index}.wr.reqs")),
+                            capacity_bytes=as_counter(stats.get(f"block.{index}.capacity")),
+                            allocation_bytes=as_counter(stats.get(f"block.{index}.allocation")),
+                            physical_bytes=as_counter(stats.get(f"block.{index}.physical")),
+                        )
+                    )
+
                 count = as_counter(stats.get("net.count")) or 0
                 for index in range(count):
                     interface_name = stats.get(f"net.{index}.name")
@@ -427,7 +551,7 @@ class LibvirtCollector:
                     LOG.debug("no Neutron port UUID for libvirt interface %s", interface_name)
                     continue
                 samples.append(VNICSample(instance_uuid, interface_name, port_uuid, rx, tx))
-            return samples
+            return CollectionBatch(vnics=samples, instances=instances, disks=disks)
         finally:
             connection.close()
 
@@ -456,17 +580,21 @@ def run_cycle(
     resolver: OVNResolver,
     producer: Any,
     previous_counters: dict[tuple[str, str, str], tuple[int, int]],
+    previous_cpu: dict[str, PreviousCPU],
+    previous_disk_counters: dict[tuple[str, str], tuple],
 ) -> CycleResult:
     now = int(time.time())
     emitted = 0
     skipped = 0
     baselines = 0
+    instance_baselines = 0
+    disk_baselines = 0
     active_keys: set[tuple[str, str, str]] = set()
     discovery_started = time.monotonic()
-    vnics = collector.read()
+    batch = collector.read()
     discovery_seconds = time.monotonic() - discovery_started
     resolution_seconds = 0.0
-    for vnic in vnics:
+    for vnic in batch.vnics:
         resolution_started = time.monotonic()
         metadata = resolver.resolve(vnic.port_uuid)
         resolution_seconds += time.monotonic() - resolution_started
@@ -485,22 +613,20 @@ def run_cycle(
         key = (vnic.instance_uuid, vnic.port_uuid, vnic.interface_name)
         active_keys.add(key)
         previous = previous_counters.get(key)
-        baseline = previous is None
-        if baseline:
-            rx_delta = tx_delta = 0
+        previous_counters[key] = (vnic.rx, vnic.tx)
+        if previous is None:
             baselines += 1
-        else:
-            previous_rx, previous_tx = previous
-            rx_delta = vnic.rx if vnic.rx < previous_rx else vnic.rx - previous_rx
-            tx_delta = vnic.tx if vnic.tx < previous_tx else vnic.tx - previous_tx
+            continue
+        previous_rx, previous_tx = previous
+        rx_delta = vnic.rx if vnic.rx < previous_rx else vnic.rx - previous_rx
+        tx_delta = vnic.tx if vnic.tx < previous_tx else vnic.tx - previous_tx
         print(
             f"region_name={args.region_name} instance_uuid={vnic.instance_uuid} "
             f"network_uuid={metadata.network_uuid} "
             f"port_uuid={vnic.port_uuid} interface={vnic.interface_name} "
             f"rx_mib={rx_delta / 1024 / 1024:.3f} "
             f"tx_mib={tx_delta / 1024 / 1024:.3f} "
-            f"total_mib={(rx_delta + tx_delta) / 1024 / 1024:.3f} "
-            f"baseline={str(baseline).lower()}",
+            f"total_mib={(rx_delta + tx_delta) / 1024 / 1024:.3f}",
             flush=True,
         )
         sample = {
@@ -510,19 +636,105 @@ def run_cycle(
             "instance_uuid": vnic.instance_uuid,
             "port_uuid": metadata.port_uuid,
             "network_uuid": metadata.network_uuid,
-            "rx": vnic.rx,
-            "tx": vnic.tx,
-            "is_baseline": baseline,
+            "rx_bytes": rx_delta,
+            "tx_bytes": tx_delta,
         }
         if args.publish_kafka:
             producer.produce(args.topic, key=vnic.port_uuid, value=json.dumps(sample).encode())
             producer.poll(0)
-        previous_counters[key] = (vnic.rx, vnic.tx)
         emitted += 1
         LOG.debug("sampled %s on %s", vnic.port_uuid, vnic.interface_name)
+
+    active_instances = {sample.instance_uuid for sample in batch.instances}
+    now_mono = time.monotonic()
+    for instance in batch.instances:
+        prev = previous_cpu.get(instance.instance_uuid)
+        if prev is None or instance.vcpus == 0:
+            cpu_pct = None
+            instance_baselines += 1
+        else:
+            dt = now_mono - prev.ts
+            if dt <= 0:
+                cpu_pct = None
+            else:
+                delta_ns = instance.cpu_time_ns - prev.cpu_time_ns
+                if delta_ns < 0:
+                    delta_ns = instance.cpu_time_ns
+                capacity_ns = dt * 1e9 * instance.vcpus
+                cpu_pct = round(100.0 * delta_ns / capacity_ns, 2)
+                cpu_pct = max(0.0, min(100.0, cpu_pct))
+        previous_cpu[instance.instance_uuid] = PreviousCPU(
+            cpu_time_ns=instance.cpu_time_ns, ts=now_mono,
+        )
+        if cpu_pct is None:
+            continue
+        sample = {
+            "ts": now,
+            "host": args.host,
+            "region_name": args.region_name,
+            "instance_uuid": instance.instance_uuid,
+            "cpu_pct": cpu_pct,
+            "memory_actual_bytes": instance.memory_actual_bytes,
+            "memory_rss_bytes": instance.memory_rss_bytes,
+            "memory_usable_bytes": instance.memory_usable_bytes,
+        }
+        if args.publish_kafka:
+            producer.produce(
+                args.instance_topic,
+                key=instance.instance_uuid,
+                value=json.dumps(sample).encode(),
+            )
+            producer.poll(0)
+
+    active_disks = {(sample.instance_uuid, sample.device) for sample in batch.disks}
+    for disk in batch.disks:
+        key = (disk.instance_uuid, disk.device)
+        prev_disk = previous_disk_counters.get(key)
+        previous_disk_counters[key] = (
+            disk.read_bytes, disk.write_bytes,
+            disk.read_requests, disk.write_requests,
+        )
+        if prev_disk is None:
+            disk_baselines += 1
+            continue
+        prev_rb, prev_wb, prev_rr, prev_wr = prev_disk
+
+        def _delta(cur, prev):
+            if cur is None or prev is None:
+                return None
+            return cur if cur < prev else cur - prev
+
+        sample = {
+            "ts": now,
+            "host": args.host,
+            "region_name": args.region_name,
+            "instance_uuid": disk.instance_uuid,
+            "device": disk.device,
+            "read_bytes": _delta(disk.read_bytes, prev_rb),
+            "write_bytes": _delta(disk.write_bytes, prev_wb),
+            "read_requests": _delta(disk.read_requests, prev_rr),
+            "write_requests": _delta(disk.write_requests, prev_wr),
+            "capacity_bytes": disk.capacity_bytes,
+            "allocation_bytes": disk.allocation_bytes,
+            "physical_bytes": disk.physical_bytes,
+        }
+        if args.publish_kafka:
+            producer.produce(
+                args.disk_topic,
+                key=f"{disk.instance_uuid}/{disk.device}",
+                value=json.dumps(sample).encode(),
+            )
+            producer.poll(0)
+
     for key in tuple(previous_counters):
         if key not in active_keys:
             del previous_counters[key]
+    for iid in list(previous_cpu):
+        if iid not in active_instances:
+            del previous_cpu[iid]
+    for dk in list(previous_disk_counters):
+        if dk not in active_disks:
+            del previous_disk_counters[dk]
     if args.publish_kafka:
         outstanding = producer.flush(30)
         if outstanding:
@@ -531,6 +743,10 @@ def run_cycle(
         emitted=emitted,
         skipped=skipped,
         baselines=baselines,
+        instances=len(batch.instances),
+        instance_baselines=instance_baselines,
+        disks=len(batch.disks),
+        disk_baselines=disk_baselines,
         discovery_seconds=discovery_seconds,
         resolution_seconds=resolution_seconds,
     )
@@ -549,23 +765,44 @@ def main() -> int:
         except ImportError:
             LOG.error("install confluent-kafka or omit --publish-kafka")
             return 2
-        producer = Producer({"bootstrap.servers": args.bootstrap_servers, "linger.ms": 50})
+        producer_conf = {"bootstrap.servers": args.bootstrap_servers, "linger.ms": 50}
+        if args.sasl_username and args.sasl_password:
+            producer_conf.update({
+                "security.protocol": "SASL_PLAINTEXT",
+                "sasl.mechanism": "SCRAM-SHA-256",
+                "sasl.username": args.sasl_username,
+                "sasl.password": args.sasl_password,
+            })
+        producer = Producer(producer_conf)
 
     ovsdb = OVSDBClients(args)
     collector = LibvirtCollector(args, ovsdb)
     resolver = OVNResolver(ovsdb)
     previous_counters: dict[tuple[str, str, str], tuple[int, int]] = {}
+    previous_cpu: dict[str, PreviousCPU] = {}
+    previous_disk_counters: dict[tuple[str, str], tuple] = {}
     while True:
         started = time.monotonic()
         try:
             result = run_cycle(
-                args, collector, resolver, producer, previous_counters
+                args,
+                collector,
+                resolver,
+                producer,
+                previous_counters,
+                previous_cpu,
+                previous_disk_counters,
             )
             LOG.info(
-                "cycle: %d interfaces, %d baselines, %d unresolved/non-Nova ports, "
+                "cycle: %d interfaces (%d baselines), %d instances (%d baselines), "
+                "%d disks (%d baselines), %d unresolved/non-Nova ports, "
                 "%d cached ports; queries: discovery=%.3fs resolution=%.3fs total=%.3fs",
                 result.emitted,
                 result.baselines,
+                result.instances,
+                result.instance_baselines,
+                result.disks,
+                result.disk_baselines,
                 result.skipped,
                 len(resolver.cache),
                 result.discovery_seconds,

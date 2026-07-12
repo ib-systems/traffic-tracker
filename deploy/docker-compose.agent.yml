@@ -1,0 +1,26 @@
+services:
+  ovn-traffic-agent:
+    image: ovn-traffic-agent:latest
+    container_name: ovn-traffic-agent
+    command:
+      - --bootstrap-servers
+      - ${KAFKA_BOOTSTRAP_SERVERS:?Set KAFKA_BOOTSTRAP_SERVERS}
+      - --sasl-username
+      - ${KAFKA_SASL_USERNAME:-agent}
+      - --sasl-password
+      - ${KAFKA_SASL_PASSWORD:-agentpass}
+      - --libvirt-uri
+      - ${LIBVIRT_URI:-qemu:///system}
+      - --libvirt-username
+      - ${LIBVIRT_USERNAME:-}
+      - --libvirt-password
+      - ${LIBVIRT_PASSWORD:-}
+      - --ovn-nb-db
+      - ${OVN_NB_DB:?Set OVN_NB_DB}
+      - --region-name
+      - ${REGION_NAME:-RegionOne}
+      - --interval
+      - "${POLL_INTERVAL:-60}"
+      - --publish-kafka
+    network_mode: host
+    restart: unless-stopped

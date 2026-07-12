@@ -76,3 +76,102 @@ ORDER BY region_name, port;
 
 -- Kafka consumer health
 SELECT * FROM system.kafka_consumers FORMAT Vertical;
+
+-- Raw CPU/RAM samples. Memory fields are NULL when libvirt does not expose
+-- the corresponding balloon statistic.
+SELECT
+    ts,
+    region_name,
+    host,
+    instance_uuid,
+    cpu_time_ns,
+    vcpus,
+    formatReadableSize(memory_actual_bytes) AS memory_actual,
+    formatReadableSize(memory_rss_bytes) AS memory_rss,
+    formatReadableSize(memory_usable_bytes) AS memory_usable,
+    is_baseline
+FROM instance_samples
+ORDER BY ts DESC
+LIMIT 20;
+
+-- Closed-hour CPU utilization and RAM gauges per instance.
+SELECT
+    hour,
+    region_name,
+    host,
+    instance_uuid,
+    round(cpu_utilization_pct, 2) AS cpu_pct,
+    vcpus,
+    formatReadableTimeDelta(cpu_time_ns / 1000000000) AS cpu_time,
+    formatReadableSize(memory_actual_avg_bytes) AS memory_actual_avg,
+    formatReadableSize(memory_rss_max_bytes) AS memory_rss_max,
+    formatReadableSize(memory_usable_min_bytes) AS memory_usable_min,
+    samples
+FROM instance_metrics_hourly FINAL
+ORDER BY hour DESC, region_name, instance_uuid
+LIMIT 20;
+
+-- Fleet CPU and RAM by region for the latest materialized hour.
+SELECT
+    region_name,
+    hour,
+    count() AS instances,
+    round(avg(cpu_utilization_pct), 2) AS avg_instance_cpu_pct,
+    round(sum(cpu_time_ns) / 1000000000, 2) AS cpu_seconds,
+    formatReadableSize(sum(memory_actual_avg_bytes)) AS allocated_memory,
+    formatReadableSize(sum(memory_rss_avg_bytes)) AS resident_memory
+FROM instance_metrics_hourly FINAL
+WHERE hour = (SELECT max(hour) FROM instance_metrics_hourly)
+GROUP BY region_name, hour
+ORDER BY region_name;
+
+-- Raw per-device disk counters and gauges.
+SELECT
+    ts,
+    region_name,
+    host,
+    instance_uuid,
+    device,
+    formatReadableSize(read_bytes) AS read_total,
+    formatReadableSize(write_bytes) AS write_total,
+    read_requests,
+    write_requests,
+    formatReadableSize(capacity_bytes) AS capacity,
+    formatReadableSize(allocation_bytes) AS allocation,
+    is_baseline
+FROM disk_samples
+ORDER BY ts DESC
+LIMIT 20;
+
+-- Closed-hour reset-aware disk I/O and latest allocation per device.
+SELECT
+    hour,
+    region_name,
+    host,
+    instance_uuid,
+    device,
+    formatReadableSize(read_bytes) AS bytes_read,
+    formatReadableSize(write_bytes) AS bytes_written,
+    read_requests,
+    write_requests,
+    formatReadableSize(capacity_last_bytes) AS capacity,
+    formatReadableSize(allocation_last_bytes) AS allocation,
+    formatReadableSize(physical_last_bytes) AS physical,
+    samples
+FROM disk_metrics_hourly FINAL
+ORDER BY hour DESC, region_name, instance_uuid, device
+LIMIT 20;
+
+-- Per-instance disk I/O over a requested period.
+SELECT
+    region_name,
+    instance_uuid,
+    sum(read_bytes) AS read_bytes,
+    sum(write_bytes) AS write_bytes,
+    sum(read_requests) AS read_requests,
+    sum(write_requests) AS write_requests
+FROM disk_metrics_hourly FINAL
+WHERE hour >= toDateTime('2026-07-01 00:00:00')
+GROUP BY region_name, instance_uuid
+ORDER BY region_name, instance_uuid
+LIMIT 20;

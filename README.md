@@ -1,190 +1,184 @@
-# Per-port traffic accounting PoC
-
-The primary PoC is a real ML2/OVN compute-node collector:
+# Compute metrics and per-port traffic accounting PoC
 
 ```text
-libvirt cumulative vNIC counters -> ovn_agent.py -> Kafka -> ClickHouse
-                                           |             |
-                                           +-> NBDB      +-> hourly volumes
+libvirt bulk domain stats -> ovn_agent.py -> Redpanda -> ClickHouse
+                               |              |          |
+                               +-> OVN NBDB    |          +-> 5-min / hourly aggregates
+                                              +-> three Kafka-compatible topics
 ```
 
-ClickHouse receives cumulative RX/TX counters and computes reset-aware usage
-per region, instance, port, and network. It retains raw samples for six hours
-and aggregated per-port hourly volume for three months.
+The agent computes CPU utilization, network deltas, and disk I/O deltas
+locally, then publishes ready-to-aggregate values to Redpanda. ClickHouse
+stores raw samples (6h TTL), 5-minute aggregates (7d TTL), and hourly
+aggregates (3 months TTL). No window functions or delta computation in
+ClickHouse — MVs are simple `sum()`/`avg()` GROUP BY.
 
-## OVN PoC
+## Motivation
 
-`ovn_agent.py` is the real collector. One poll uses libvirt
-`getAllDomainStats()` to retrieve all running-domain vNIC counters. It maps
-each interface to a Neutron port and network without command-line clients:
+Classical OpenStack metrics stack is Ceilometer, Gnocchi (+ Cloudkitty for rating optionally).
+It was hard for me to find out what are pros and cons of this stack. So I decided to implement my own metrics stack for OpenStack.
+
+## Architecture
+
+### What the agent sends
+
+All delta/utilization computation happens in the agent, not ClickHouse:
+
+- **CPU**: `cpu_pct` — computed from consecutive `cpu_time_ns` readings
+- **Network**: `rx_bytes`, `tx_bytes` — per-interval deltas (not cumulative)
+- **Disk I/O**: `read_bytes`, `write_bytes`, `read_requests`, `write_requests` — per-interval deltas
+- **Gauges**: `memory_actual_bytes`, `memory_rss_bytes`, `memory_usable_bytes`, `capacity_bytes`, `allocation_bytes`, `physical_bytes` — sent as-is
+
+The first sample after agent start is skipped (no previous value to diff). No `is_baseline` flag — the agent simply doesn't emit until it has two consecutive readings.
+
+### Aggregation tiers
+
+| Tier | Granularity | TTL | Source | Dashboard use |
+|------|-------------|-----|--------|---------------|
+| Raw samples | ~1 min | 6 hours | Kafka engine MVs | 6h view |
+| 5-min aggregates | 5 min | 7 days | Refreshable MV every 5 min | 12h/24h view |
+| Hourly aggregates | 1 hour | 3 months | Refreshable MV every 10 min | 7d view, billing |
+
+All tiers aggregate directly from raw samples (parallel, not chained).
+
+## OVN agent
+
+`ovn_agent.py` is the production collector. One poll uses libvirt
+`getAllDomainStats()` to retrieve CPU, balloon-memory, block-device, and vNIC
+statistics for all running domains. It maps each interface to a Neutron port
+and network:
 
 1. Read `virtualport/parameters@interfaceid` from the libvirt domain XML.
-2. If that field is absent, match `tap<port-UUID-prefix>` and the libvirt
-   domain UUID against NBDB `Logical_Switch_Port.name` and
-   `external_ids["neutron:device_id"]`.
-3. Read `external_ids["neutron:network_name"]` from the matching logical
-   switch port to derive `network_uuid`.
+2. If absent, match `tap<port-UUID-prefix>` against NBDB
+   `Logical_Switch_Port.name` and `external_ids["neutron:device_id"]`.
+3. Read `external_ids["neutron:network_name"]` to derive `network_uuid`.
 
 The agent talks directly to OVN Northbound through `ovsdbapp` IDL. It does not
-invoke `virsh`, `ovs-vsctl`, or `ovn-nbctl`. It currently accounts only for
-active Nova compute ports (`neutron:device_owner=compute:nova`).
+invoke `virsh`, `ovs-vsctl`, or `ovn-nbctl`. Only active Nova compute ports
+(`neutron:device_owner=compute:nova`) are collected.
+
+### Docker image
+
+```bash
+docker build -t ovn-traffic-agent:latest .
+```
 
 ### Run on a compute node
 
 ```bash
-# The libvirt and Open vSwitch Python bindings are normally supplied by the
-# host distribution. ovsdbapp is needed for native OVSDB access.
-pip install ovsdbapp
-
-# The default mode prints a reset-aware traffic delta every 10 seconds.
-python3 ovn_agent.py \
-  --libvirt-uri qemu+tcp://<libvirt-host>/system \
-  --libvirt-username '<username>' \
-  --libvirt-password '<password>' \
-  --region-name '<openstack-region>' \
-  --ovn-nb-db tcp:<nbdb-host-1>:6641,tcp:<nbdb-host-2>:6641
+docker compose -f deploy/docker-compose.agent.yml up -d
 ```
 
-The first output for an interface is a zero-MiB baseline. Subsequent rows show
-the RX, TX, and total MiB processed during the prior polling interval. When a
-counter decreases because a vNIC is recreated or reset, the agent treats the
-new counter value as the interval delta instead of emitting a negative value.
+Configure via `.env` (see `deploy/.env.example`):
 
-The host needs `python3-libvirt`, the Open vSwitch Python bindings, and network
-access to the configured libvirt and NBDB endpoints. The shown `tcp:` NBDB
-cluster does not require TLS options.
+```env
+KAFKA_BOOTSTRAP_SERVERS=metrics.example.com:9092
+KAFKA_SASL_USERNAME=agent
+KAFKA_SASL_PASSWORD=agentpass
+LIBVIRT_URI=qemu:///system
+LIBVIRT_USERNAME=nova
+LIBVIRT_PASSWORD=<password>
+OVN_NB_DB=tcp:1.1.0.1:6641
+REGION_NAME=RegionOne
+POLL_INTERVAL=60
+```
 
-The agent reports per-poll query timing, split into libvirt/NBDB discovery and
-NBDB port metadata resolution. A warm port/network cache makes the latter
-effectively free during normal polling.
-
-`--region-name` (or `REGION_NAME`) defaults to `RegionOne`. It is sent in every
-Kafka record and is part of the ClickHouse aggregation key, allowing a shared
-ClickHouse deployment to report usage independently for each OpenStack region.
-
-For a SASL-protected remote libvirt endpoint, pass
-`--libvirt-username` and `--libvirt-password`. Alternatively,
-`--libvirt-auth-file` reads Nova's `credentials-default` section. The password
-argument is visible to local process inspection, so the auth-file or
-`LIBVIRT_PASSWORD` environment-variable form is preferable outside this PoC.
-
-### Send samples to Kafka
-
-The default mode only prints interval usage. Add `--publish-kafka` to send the
-underlying cumulative counters to the billing pipeline; ClickHouse, not the
-agent's printed delta, is the billing source of truth.
+Or run directly:
 
 ```bash
 python3 ovn_agent.py \
   --libvirt-uri qemu+tcp://<libvirt-host>/system \
   --libvirt-username '<username>' \
   --libvirt-password '<password>' \
+  --ovn-nb-db tcp:<nbdb-host>:6641 \
+  --bootstrap-servers <redpanda-host>:9092 \
+  --sasl-username agent \
+  --sasl-password agentpass \
   --region-name '<openstack-region>' \
-  --ovn-nb-db tcp:<nbdb-host-1>:6641,tcp:<nbdb-host-2>:6641 \
-  --bootstrap-servers kafka.example:9092 \
   --publish-kafka
 ```
 
-`is_baseline=true` is sent for the first observation of every port after an
-agent starts. This prevents a process restart from charging all traffic that
-predated it. Kafka redelivery is harmless because same-second counters are
-collapsed before delta calculation. Each record includes `region_name`,
-`instance_uuid`, `port_uuid`, and `network_uuid`.
+### Agent restart behavior
 
-### Current scope
+On restart, the agent has no previous counter values. The first poll
+establishes baselines for CPU, network, and disk — no samples are emitted.
+The second poll computes deltas normally. No data loss beyond one skipped
+interval per metric.
 
-- The supported OVN source is the Northbound database; Southbound DB is not
-  queried.
-- The collector reads libvirt counters, not OVS interface statistics.
-- Port and network mappings are cached in memory. A restart is billing-safe
-  because the next observation is a baseline.
-- This is a single-process PoC. Production deployment still needs service
-  management, Kafka authentication, monitoring, and a migration policy.
+## Server stack
+
+```bash
+docker compose -f deploy/docker-compose.server.yml up -d
+```
+
+Runs Redpanda (SASL/SCRAM-SHA-256), Redpanda Console, and ClickHouse.
+Credentials via env vars (see `deploy/.env.example`).
+
+The init container creates an `agent` SASL user with topic/group ACLs and
+pre-creates the three topics with 10-min retention and 16MB segments.
+
+## Dashboard
+
+Lightweight React + ApexCharts dashboard querying ClickHouse HTTP API.
+
+```bash
+cd dashboard && npm install && npm run dev
+```
+
+Three pages:
+- **Instance** — per-instance CPU, RAM, Disk I/O, Network charts with 6h/12h/24h/7d range toggle
+- **Per Node** — aggregate disk I/O and network traffic for all instances on a host
+- **Top Usage** — top 10 instances by CPU, RAM, Network, Disk (avg over 24h from hourly tables)
+
+The Vite dev server proxies `/ch` to ClickHouse `localhost:8123`.
 
 ## Synthetic load generator
 
-`agent.py` is retained solely to generate deterministic fake ports and counter
-resets for ClickHouse throughput and schema tests. It is not used on compute
-nodes.
+`agent.py` generates realistic metrics for development. It sends the same
+delta-based payload format as `ovn_agent.py`.
 
 ```bash
-docker compose up -d
+docker compose -f deploy/docker-compose.server.yml up -d
 pip install confluent-kafka
-python3 agent.py
+python3 agent.py --instances 50000 --sasl-username agent --sasl-password agentpass
 ```
-
-## ClickHouse setup
-
-Schema is applied automatically on first ClickHouse start
-(`schema.sql` mounted into `/docker-entrypoint-initdb.d/`).
-
-The region dimension changes the Kafka table, materialized views, and sorting
-keys. Recreate the PoC ClickHouse volume when upgrading an existing test stack
-to this schema.
-
-## Verify
-
-```bash
-docker exec -it poc-clickhouse clickhouse-client --password clickhouse
-```
-
-Then run queries from `queries.sql`. Within ~30s of starting the collector
-with `--publish-kafka`, `port_samples` fills, and:
-
-```sql
-SELECT * FROM port_usage(period_start = '2026-06-01 00:00:00');
-```
-
-returns period-to-date volume per port. Confirm that a vNIC counter reset
-produces a positive new-counter delta, rather than negative usage, and that a
-new agent baseline contributes zero billed traffic.
-
-`port_volume_hourly` stays empty until the first wall-clock hour closes
-and the next refresh tick (≤10 min) materializes it; until then the
-usage view serves everything from raw samples.
 
 ## Pipeline layout
 
-| object                  | role                                       | TTL       |
-|-------------------------|--------------------------------------------|-----------|
-| `port_stats_queue`      | Kafka engine source                        | —         |
-| `port_samples_mv`       | incremental MV: Kafka → raw samples        | —         |
-| `port_samples`          | raw cumulative samples (poll-rate)         | 6 hours   |
-| `port_volume_hourly_mv` | refreshable MV: hour-close job (10 min)    | —         |
-| `port_volume_hourly`    | reset-aware volume per port per hour       | 3 months  |
-| `port_usage`            | parameterized view: period usage           | —         |
+| Table | Role | TTL |
+|-------|------|-----|
+| `port_stats_queue` | Kafka source for network deltas | — |
+| `port_samples` | raw per-interval RX/TX deltas | 6 hours |
+| `port_volume_5min` | 5-min aggregated network volume | 7 days |
+| `port_volume_hourly` | hourly aggregated network volume | 3 months |
+| `port_usage` | period-to-date traffic view | — |
+| `instance_stats_queue` | Kafka source for CPU/RAM | — |
+| `instance_samples` | raw cpu_pct and RAM gauges | 6 hours |
+| `instance_metrics_5min` | 5-min CPU/RAM aggregates | 7 days |
+| `instance_metrics_hourly` | hourly CPU/RAM aggregates | 3 months |
+| `disk_stats_queue` | Kafka source for disk deltas | — |
+| `disk_samples` | raw disk I/O deltas and size gauges | 6 hours |
+| `disk_metrics_5min` | 5-min disk aggregates | 7 days |
+| `disk_metrics_hourly` | hourly disk aggregates | 3 months |
 
-Hourly volumes are the only long-term data; raw samples and Kafka
-segments are self-expiring buffers. Freshness: `port_volume_hourly`
-lags up to one hour + refresh interval; `port_usage` adds a live
-delta-sum over post-watermark raw samples and is fresh to the last
-agent poll.
+## Storage estimate (50k instances, 1-min polling)
 
-Billing sync = hourly per-instance `sum()` over `port_volume_hourly`
-within the period window, overwrite-upserted into the billing DB.
-Period rollover needs no reset: a new period is just a new window.
-
-Raw, hourly, and period-usage rows include `region_name` and `network_uuid`.
-The network UUID is resolved from the OVN logical-switch port's
-`neutron:network_name` external ID.
+| Tier | Size |
+|------|------|
+| Raw samples (6h) | ~620 MB |
+| 5-min aggregates (7d) | ~7.2 GB |
+| Hourly aggregates (3mo) | ~8.6 GB |
+| **Total** | **~16.4 GB** |
 
 ## Notes
 
-- Kafka has two listeners: `localhost:9092` (agent on host),
-  `kafka:19092` (ClickHouse inside the compose network).
-- Kafka engine consumption starts only once an MV is attached — already
-  the case here.
-- Duplicates from Kafka redelivery are harmless: identical consecutive
-  counters produce delta 0. Same-second rows are additionally collapsed
-  with `max()` before delta computation so the window order stays
-  deterministic.
-- To test reset accounting deliberately, bump `RESET_CHANCE` in `agent.py`.
-- The ClickHouse data dir lives on an anonymous Docker volume, so
-  `docker compose up -d` after an image bump keeps data and does NOT
-  re-run `schema.sql`. For a clean slate (and schema re-apply):
-  `docker compose up -d --renew-anon-volumes clickhouse`.
-- For an existing ClickHouse deployment, change the aggregate retention with:
-
-  ```sql
-  ALTER TABLE port_volume_hourly MODIFY TTL hour + INTERVAL 3 MONTH;
-  ```
+- Redpanda has two Kafka listeners: `localhost:9092` (external),
+  `redpanda:19092` (internal compose network).
+- SASL/SCRAM-SHA-256 is enabled by default. The `admin` superuser is
+  bootstrapped via `RP_BOOTSTRAP_USER`. The `agent` user is created by
+  the init container.
+- `--region-name` is part of the ClickHouse aggregation key, allowing a
+  shared deployment to report usage per OpenStack region.
+- For SASL-protected libvirt, use `--libvirt-username`/`--libvirt-password`
+  or `--libvirt-auth-file` (reads Nova's `credentials-default` section).
+  The `LIBVIRT_PASSWORD` env var avoids process-list exposure.

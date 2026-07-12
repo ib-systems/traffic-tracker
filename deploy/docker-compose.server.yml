@@ -1,28 +1,14 @@
 services:
-  chouse-ui:
-    image: ghcr.io/daun-gatal/chouse-ui:latest
-    container_name: chouse-ui
-    ports:
-      - "5521:5521"
-    environment:
-      NODE_ENV: production
-      JWT_SECRET: dev-secret-change-medev-secret-change-medev-secret-change-me
-      RBAC_ENCRYPTION_KEY: ranfcumjakgdzrkuoyrccawdnruuipnk
-      RBAC_ENCRYPTION_SALT: ghvbumkvajvwlqtmivbdssynooofpliqedhwduifjumuvaunujpecqyecqjexzia
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
-
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
-    container_name: poc-redpanda
+    container_name: redpanda
     command:
       - redpanda
       - start
       - --kafka-addr
       - internal://0.0.0.0:19092,external://0.0.0.0:9092
       - --advertise-kafka-addr
-      - internal://redpanda:19092,external://localhost:9092
+      - internal://redpanda:19092,external://${REDPANDA_EXTERNAL_HOST:-localhost}:9092
       - --rpc-addr
       - redpanda:33145
       - --advertise-rpc-addr
@@ -37,16 +23,17 @@ services:
       - --set
       - redpanda.enable_sasl=true
     environment:
-      RP_BOOTSTRAP_USER: "admin:changeme"
+      RP_BOOTSTRAP_USER: "admin:${REDPANDA_ADMIN_PASSWORD:-changeme}"
     ports:
       - "9092:9092"
     volumes:
       - redpanda-data:/var/lib/redpanda/data
     healthcheck:
-      test: ["CMD", "rpk", "cluster", "health", "-X", "user=admin", "-X", "pass=changeme", "-X", "sasl.mechanism=SCRAM-SHA-256"]
+      test: ["CMD", "rpk", "cluster", "health", "-X", "user=admin", "-X", "pass=${REDPANDA_ADMIN_PASSWORD:-changeme}", "-X", "sasl.mechanism=SCRAM-SHA-256"]
       interval: 5s
       timeout: 5s
       retries: 12
+    restart: unless-stopped
 
   redpanda-init:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
@@ -56,13 +43,13 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        rpk -X brokers=redpanda:19092 -X user=admin -X pass=changeme -X sasl.mechanism=SCRAM-SHA-256 -X admin.hosts=redpanda:9644 acl user create agent -p agentpass --mechanism scram-sha-256 || true
-        rpk -X brokers=redpanda:19092 -X user=admin -X pass=changeme -X sasl.mechanism=SCRAM-SHA-256 acl create --allow-principal User:agent --operation all --topic '*' --group '*'
-        rpk -X brokers=redpanda:19092 -X user=admin -X pass=changeme -X sasl.mechanism=SCRAM-SHA-256 topic create --if-not-exists --partitions 1 --replicas 1 --topic-config retention.ms=600000 --topic-config segment.bytes=16777216 port-stats instance-stats disk-stats
+        rpk -X brokers=redpanda:19092 -X user=admin -X pass=${REDPANDA_ADMIN_PASSWORD:-changeme} -X sasl.mechanism=SCRAM-SHA-256 -X admin.hosts=redpanda:9644 acl user create ${AGENT_SASL_USERNAME:-agent} -p ${AGENT_SASL_PASSWORD:-agentpass} --mechanism scram-sha-256 || true
+        rpk -X brokers=redpanda:19092 -X user=admin -X pass=${REDPANDA_ADMIN_PASSWORD:-changeme} -X sasl.mechanism=SCRAM-SHA-256 acl create --allow-principal User:${AGENT_SASL_USERNAME:-agent} --operation all --topic '*' --group '*'
+        rpk -X brokers=redpanda:19092 -X user=admin -X pass=${REDPANDA_ADMIN_PASSWORD:-changeme} -X sasl.mechanism=SCRAM-SHA-256 topic create --if-not-exists --partitions 1 --replicas 1 --topic-config retention.ms=600000 --topic-config segment.bytes=16777216 port-stats instance-stats disk-stats
 
   redpanda-console:
     image: docker.redpanda.com/redpandadata/console:v3.8.0
-    container_name: poc-redpanda-console
+    container_name: redpanda-console
     depends_on:
       redpanda:
         condition: service_healthy
@@ -77,17 +64,18 @@ services:
             enabled: true
             mechanism: SCRAM-SHA-256
             username: admin
-            password: changeme
+            password: ${REDPANDA_ADMIN_PASSWORD:-changeme}
         redpanda:
           adminApi:
             enabled: true
             urls: ["http://redpanda:9644"]
     ports:
       - "8080:8080"
+    restart: unless-stopped
 
   clickhouse:
     image: clickhouse/clickhouse-server:26.5
-    container_name: poc-clickhouse
+    container_name: clickhouse
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -95,12 +83,15 @@ services:
       - "8123:8123"
       - "9000:9000"
     environment:
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
     volumes:
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - ../schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
     ulimits:
       nofile: 262144
+    restart: unless-stopped
 
 volumes:
   redpanda-data:
+  clickhouse-data:
