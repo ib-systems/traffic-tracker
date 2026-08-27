@@ -3,7 +3,7 @@
 ```text
 libvirt bulk domain stats -> ovn_agent.py -> Redpanda -> ClickHouse
                                |              |          |
-                               +-> OVN NBDB    |          +-> 5-min / hourly aggregates
+                               +-> OVN SBDB    |          +-> 5-min / hourly aggregates
                                               +-> three Kafka-compatible topics
 ```
 
@@ -49,13 +49,99 @@ statistics for all running domains. It maps each interface to a Neutron port
 and network:
 
 1. Read `virtualport/parameters@interfaceid` from the libvirt domain XML.
-2. If absent, match `tap<port-UUID-prefix>` against NBDB
-   `Logical_Switch_Port.name` and `external_ids["neutron:device_id"]`.
-3. Read `external_ids["neutron:network_name"]` to derive `network_uuid`.
+2. If absent, match `tap<port-UUID-prefix>` against SBDB
+   `Port_Binding.logical_port` and `external_ids["neutron:device_id"]`.
+3. Select only an `up` binding whose primary `chassis` is this compute node.
+4. Read `external_ids["neutron:network_name"]` to derive `network_uuid`.
 
-The agent talks directly to OVN Northbound through `ovsdbapp` IDL. It does not
-invoke `virsh`, `ovs-vsctl`, or `ovn-nbctl`. Only active Nova compute ports
-(`neutron:device_owner=compute:nova`) are collected.
+The agent talks directly to OVN Southbound through `ovsdbapp` IDL. It refreshes
+one in-memory `Port_Binding` snapshot per poll and does not invoke `virsh`,
+`ovs-vsctl`, or `ovn-sbctl`. Only active Nova compute ports
+(`neutron:device_owner=compute:nova`) bound to the configured chassis are
+collected. During live migration, only the primary `chassis` is accepted, so an
+`additional_chassis` does not emit duplicate usage.
+
+### Metric selection
+
+The YAML `metrics` list controls which libvirt stat groups are requested and
+which Kafka topics receive samples. Supported values are `network`, `disk`,
+`ram`, and `cpu`.
+
+```yaml
+# Everything (default)
+metrics: [network, disk, ram, cpu]
+
+# Network traffic only
+metrics: [network]
+```
+
+Values are case-insensitive, whitespace is ignored, and at least one metric is
+required. RAM currently shares the `instance-stats` record with CPU, whose
+`cpu_pct` field is required, so selecting `ram` also requires `cpu`. CPU can be
+selected without RAM; its memory fields are then `null`. OVN SBDB settings are
+required only when `network` is enabled.
+
+### Multi-host YAML configuration
+
+Use a YAML config when one long-running agent scrapes multiple remote libvirt
+hosts. Every configured host gets one dedicated, long-lived thread. That thread
+opens its own read-only libvirt connection on the first scrape, reuses it for
+later scrapes, reconnects it in the same thread after a libvirt failure, and
+closes it during shutdown. Each host schedules its own polls, so a slow or
+failed host does not delay the other hosts.
+
+The main thread refreshes one immutable OVN SBDB snapshot per interval and the
+host threads use the latest available snapshot. Counter state remains isolated
+per host. Ready metric records go to a shared queue immediately; one publisher
+thread owns the Kafka client and sends records to Redpanda without waiting for
+the rest of the fleet.
+
+```yaml
+interval: 60
+metrics: [network, disk, ram, cpu]
+region_name: RegionOne
+publish_kafka: true
+
+kafka:
+  bootstrap_servers: metrics.example.com:9092
+  sasl_username: agent
+  sasl_password: replace-me
+
+ovn:
+  sb_db: tcp:192.0.2.10:6642,tcp:192.0.2.11:6642,tcp:192.0.2.12:6642
+
+libvirt:
+  username: nova
+  password: replace-me
+
+nodes:
+  - host: compute-1
+    libvirt_uri: qemu+tcp://192.0.2.101/system
+    ovn_chassis: compute-1
+  - host: compute-2
+    libvirt_uri: qemu+tcp://192.0.2.102/system
+    ovn_chassis: compute-2
+```
+
+The `compute-N` names and `192.0.2.0/24` addresses are documentation-only
+placeholders; replace them with the deployment's actual hosts and addresses.
+
+To scale across multiple agent processes or Kubernetes deployments, give each
+agent a different YAML file containing a disjoint subset of `nodes`. Do not put
+the same node in two active agents, because both would publish its metrics.
+
+See `deploy/agent.example.yml` for the complete example. Start it with:
+
+```bash
+cp deploy/agent.example.yml deploy/agent.yml
+# Replace credentials and node addresses in deploy/agent.yml.
+python3 ovn_agent.py --config deploy/agent.yml
+```
+
+The agent does not read configuration from environment variables. `--config`
+is mandatory, and explicit command-line arguments can override YAML for
+one-off diagnostics. Because the YAML contains credentials, mount the complete
+file from a Kubernetes Secret rather than a ConfigMap.
 
 ### Docker image
 
@@ -63,40 +149,36 @@ invoke `virsh`, `ovs-vsctl`, or `ovn-nbctl`. Only active Nova compute ports
 docker build -t ovn-traffic-agent:latest .
 ```
 
-### Run on a compute node
+### Run the fleet agent with Docker Compose
 
 ```bash
+cp deploy/agent.example.yml deploy/agent.yml
+# Edit deploy/agent.yml first; it is gitignored because it contains secrets.
 docker compose -f deploy/docker-compose.agent.yml up -d
 ```
 
-Configure via `.env` (see `deploy/.env.example`):
-
-```env
-KAFKA_BOOTSTRAP_SERVERS=metrics.example.com:9092
-KAFKA_SASL_USERNAME=agent
-KAFKA_SASL_PASSWORD=agentpass
-LIBVIRT_URI=qemu:///system
-LIBVIRT_USERNAME=nova
-LIBVIRT_PASSWORD=<password>
-OVN_NB_DB=tcp:1.1.0.1:6641
-REGION_NAME=RegionOne
-POLL_INTERVAL=60
-```
+Each node's `ovn_chassis` must equal its Open_vSwitch
+`external_ids:system-id`, which is also the `Chassis.name` referenced by SBDB
+`Port_Binding.chassis`.
 
 Or run directly:
 
 ```bash
-python3 ovn_agent.py \
-  --libvirt-uri qemu+tcp://<libvirt-host>/system \
-  --libvirt-username '<username>' \
-  --libvirt-password '<password>' \
-  --ovn-nb-db tcp:<nbdb-host>:6641 \
-  --bootstrap-servers <redpanda-host>:9092 \
-  --sasl-username agent \
-  --sasl-password agentpass \
-  --region-name '<openstack-region>' \
-  --publish-kafka
+python3 ovn_agent.py --config deploy/agent.yml
 ```
+
+### Run the fleet agent in Kubernetes
+
+The Kubernetes Deployment mounts the complete YAML configuration from a
+Secret, runs one collector replica, and uses `Recreate` upgrades to prevent
+duplicate collection:
+
+```bash
+kubectl -n metrics apply -f deploy/kubernetes/deployment.yml
+```
+
+See `deploy/kubernetes/README.md` for Secret creation, deployment, configuration
+updates, private-registry setup, and fleet splitting.
 
 ### Agent restart behavior
 
@@ -108,11 +190,16 @@ interval per metric.
 ## Server stack
 
 ```bash
-docker compose -f deploy/docker-compose.server.yml up -d
+cp deploy/.env.example deploy/.env
+# Edit deploy/.env and replace the example server credentials first.
+docker compose --env-file deploy/.env -f deploy/docker-compose.server.yml up -d
 ```
 
 Runs Redpanda (SASL/SCRAM-SHA-256), Redpanda Console, and ClickHouse.
-Credentials via env vars (see `deploy/.env.example`).
+Each server service also loads `deploy/.env` as its container environment.
+`--env-file` is still required because Redpanda addresses and credentials are
+expanded by Docker Compose before containers start. To use another service env
+file, set `SERVER_ENV_FILE` to a path relative to `deploy/`.
 
 The init container creates an `agent` SASL user with topic/group ACLs and
 pre-creates the three topics with 10-min retention and 16MB segments.
@@ -138,7 +225,7 @@ The Vite dev server proxies `/ch` to ClickHouse `localhost:8123`.
 delta-based payload format as `ovn_agent.py`.
 
 ```bash
-docker compose -f deploy/docker-compose.server.yml up -d
+docker compose --env-file deploy/.env -f deploy/docker-compose.server.yml up -d
 pip install confluent-kafka
 python3 agent.py --instances 50000 --sasl-username agent --sasl-password agentpass
 ```
@@ -180,5 +267,5 @@ python3 agent.py --instances 50000 --sasl-username agent --sasl-password agentpa
 - `--region-name` is part of the ClickHouse aggregation key, allowing a
   shared deployment to report usage per OpenStack region.
 - For SASL-protected libvirt, use `--libvirt-username`/`--libvirt-password`
-  or `--libvirt-auth-file` (reads Nova's `credentials-default` section).
-  The `LIBVIRT_PASSWORD` env var avoids process-list exposure.
+  overrides or set `libvirt.username`/`libvirt.password` in YAML. Alternatively,
+  set `libvirt.auth_file` in YAML to read Nova's `credentials-default` section.

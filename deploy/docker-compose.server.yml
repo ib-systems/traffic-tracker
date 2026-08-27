@@ -2,6 +2,8 @@ services:
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
     container_name: redpanda
+    env_file:
+      - ${SERVER_ENV_FILE:-.env}
     command:
       - redpanda
       - start
@@ -37,6 +39,8 @@ services:
 
   redpanda-init:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
+    env_file:
+      - ${SERVER_ENV_FILE:-.env}
     depends_on:
       redpanda:
         condition: service_healthy
@@ -50,6 +54,8 @@ services:
   redpanda-console:
     image: docker.redpanda.com/redpandadata/console:v3.8.0
     container_name: redpanda-console
+    env_file:
+      - ${SERVER_ENV_FILE:-.env}
     depends_on:
       redpanda:
         condition: service_healthy
@@ -76,6 +82,8 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:26.5
     container_name: clickhouse
+    env_file:
+      - ${SERVER_ENV_FILE:-.env}
     depends_on:
       redpanda-init:
         condition: service_completed_successfully

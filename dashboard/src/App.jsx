@@ -7,15 +7,31 @@ import DiskChartA from './charts/apex/DiskChartA';
 import NetworkChartA from './charts/apex/NetworkChartA';
 import TopUsage from './TopUsage';
 import NodeView from './NodeView';
+import AllNodesView from './AllNodesView';
 import './App.css';
 
-const PAGES = ['instance', 'node', 'top-usage'];
+const PAGES = [
+  { key: 'instance', label: 'Instance', path: '/instance' },
+  { key: 'all-nodes', label: 'All Nodes', path: '/all-nodes' },
+  { key: 'node', label: 'Per Node', path: '/per-node' },
+  { key: 'top-usage', label: 'Top Usage', path: '/top-usage' },
+];
+const PAGE_BY_PATH = Object.fromEntries(PAGES.map(page => [page.path, page.key]));
+const PATH_BY_PAGE = Object.fromEntries(PAGES.map(page => [page.key, page.path]));
 const RANGES = [
   { key: '6h', label: '6h', hours: 6 },
   { key: '12h', label: '12h', hours: 12 },
   { key: '24h', label: '24h', hours: 24 },
   { key: '7d', label: '7d', hours: 168 },
 ];
+
+function normalizedPath(pathname) {
+  return pathname.replace(/\/+$/, '') || '/';
+}
+
+function pageFromPath(pathname) {
+  return PAGE_BY_PATH[normalizedPath(pathname)] || 'instance';
+}
 
 function cpuQuery(id, range) {
   if (range.hours <= 6) {
@@ -103,7 +119,7 @@ function netQuery(id, range) {
 }
 
 export default function App() {
-  const [page, setPage] = useState('instance');
+  const [page, setPage] = useState(() => pageFromPath(window.location.pathname));
   const [range, setRange] = useState(RANGES[0]);
   const [instances, setInstances] = useState([]);
   const [selectedInstance, setSelectedInstance] = useState(null);
@@ -118,6 +134,29 @@ export default function App() {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const searchRef = useRef(null);
 
+  useEffect(() => {
+    const syncPageFromLocation = () => {
+      const nextPage = pageFromPath(window.location.pathname);
+      const canonicalPath = PATH_BY_PAGE[nextPage];
+      if (normalizedPath(window.location.pathname) !== canonicalPath) {
+        window.history.replaceState(null, '', canonicalPath);
+      }
+      setPage(nextPage);
+    };
+
+    syncPageFromLocation();
+    window.addEventListener('popstate', syncPageFromLocation);
+    return () => window.removeEventListener('popstate', syncPageFromLocation);
+  }, []);
+
+  const navigateToPage = useCallback(nextPage => {
+    const nextPath = PATH_BY_PAGE[nextPage];
+    if (normalizedPath(window.location.pathname) !== nextPath) {
+      window.history.pushState(null, '', nextPath);
+    }
+    setPage(nextPage);
+  }, []);
+
   const filtered = useMemo(() => {
     if (!search) return instances.slice(0, 50);
     const q = search.toLowerCase();
@@ -126,9 +165,21 @@ export default function App() {
 
   useEffect(() => {
     query(`
-      SELECT DISTINCT instance_uuid
-      FROM instance_samples
-      WHERE ts >= now() - INTERVAL 6 HOUR
+      SELECT instance_uuid
+      FROM (
+        SELECT instance_uuid
+        FROM port_samples
+        WHERE ts >= now() - INTERVAL 6 HOUR
+        UNION ALL
+        SELECT instance_uuid
+        FROM instance_samples
+        WHERE ts >= now() - INTERVAL 6 HOUR
+        UNION ALL
+        SELECT instance_uuid
+        FROM disk_samples
+        WHERE ts >= now() - INTERVAL 6 HOUR
+      )
+      GROUP BY instance_uuid
       ORDER BY instance_uuid
       LIMIT 1000
     `).then(rows => {
@@ -147,7 +198,21 @@ export default function App() {
         query(cpuQuery(selectedInstance, range)),
         query(diskQuery(selectedInstance, range)),
         query(netQuery(selectedInstance, range)),
-        query(`SELECT host FROM instance_samples WHERE instance_uuid = '${selectedInstance}' ORDER BY ts DESC LIMIT 1`),
+        query(`
+          SELECT host
+          FROM (
+            SELECT host, ts FROM port_samples
+            WHERE instance_uuid = '${selectedInstance}'
+            UNION ALL
+            SELECT host, ts FROM instance_samples
+            WHERE instance_uuid = '${selectedInstance}'
+            UNION ALL
+            SELECT host, ts FROM disk_samples
+            WHERE instance_uuid = '${selectedInstance}'
+          )
+          ORDER BY ts DESC
+          LIMIT 1
+        `),
       ]);
       setCpu(cpuData);
       setRam(cpuData);
@@ -177,10 +242,10 @@ export default function App() {
           <div className="page-toggle">
             {PAGES.map(p => (
               <button
-                key={p}
-                className={p === page ? 'active' : ''}
-                onClick={() => setPage(p)}
-              >{p === 'instance' ? 'Instance' : p === 'node' ? 'Per Node' : 'Top Usage'}</button>
+                key={p.key}
+                className={p.key === page ? 'active' : ''}
+                onClick={() => navigateToPage(p.key)}
+              >{p.label}</button>
             ))}
           </div>
           {page === 'instance' && (
@@ -260,6 +325,8 @@ export default function App() {
             </div>
           </div>
         </>
+      ) : page === 'all-nodes' ? (
+        <AllNodesView />
       ) : page === 'node' ? (
         <NodeView />
       ) : (

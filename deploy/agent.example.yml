@@ -1,0 +1,31 @@
+interval: 60
+command_timeout: 60
+metrics:
+  - network
+  - disk
+  - ram
+  - cpu
+region_name: RegionOne
+publish_kafka: true
+
+kafka:
+  bootstrap_servers: metrics.example.com:9092
+  sasl_username: agent
+  sasl_password: replace-me
+
+# Host names and 192.0.2.0/24 addresses below are documentation placeholders.
+ovn:
+  sb_db: tcp:192.0.2.10:6642,tcp:192.0.2.11:6642,tcp:192.0.2.12:6642
+
+libvirt:
+  username: nova
+  password: replace-me
+
+nodes:
+  - host: compute-1
+    libvirt_uri: qemu+tcp://192.0.2.101/system
+    ovn_chassis: compute-1
+
+  - host: compute-2
+    libvirt_uri: qemu+tcp://192.0.2.102/system
+    ovn_chassis: compute-2

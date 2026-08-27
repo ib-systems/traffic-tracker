@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ovn-traffic-agent
+spec:
+  replicas: 1
+  # Never overlap old and new collectors: overlapping pods would publish the
+  # same host counters twice during an ordinary rolling update.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ovn-traffic-agent
+  template:
+    metadata:
+      labels:
+        app: ovn-traffic-agent
+    spec:
+      containers:
+        - name: agent
+          image: cr.ib.systems/ovn-traffic-agent:latest
+          args:
+            - --config
+            - /etc/ovn-traffic-agent/agent.yml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ovn-traffic-agent
+              readOnly: true
+      volumes:
+        - name: config
+          secret:
+            secretName: ovn-traffic-agent-config

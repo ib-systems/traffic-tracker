@@ -14,9 +14,21 @@ export default function NodeView() {
 
   useEffect(() => {
     query(`
-      SELECT DISTINCT host
-      FROM instance_samples
-      WHERE ts >= now() - INTERVAL 6 HOUR
+      SELECT host
+      FROM (
+        SELECT host
+        FROM port_samples
+        WHERE ts >= now() - INTERVAL 6 HOUR
+        UNION ALL
+        SELECT host
+        FROM instance_samples
+        WHERE ts >= now() - INTERVAL 6 HOUR
+        UNION ALL
+        SELECT host
+        FROM disk_samples
+        WHERE ts >= now() - INTERVAL 6 HOUR
+      )
+      GROUP BY host
       ORDER BY host
     `).then(rows => {
       const h = rows.map(r => r.host);

@@ -4,3 +4,6 @@ AGENTS.md
 __pycache__/
 *.py[cod]
 .venv/
+.env.agent
+deploy/.env
+deploy/agent.yml

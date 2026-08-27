@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir --prefix=/install \
     confluent-kafka \
     ovsdbapp \
     ovs \
-    libvirt-python
+    libvirt-python \
+    PyYAML
 
 FROM python:3.12-slim
 
