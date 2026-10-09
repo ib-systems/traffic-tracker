@@ -19,11 +19,13 @@ class FakeDomain:
     def UUIDString(self):
         return INSTANCE_UUID
 
+    interface_type = "bridge"
+
     def XMLDesc(self, flags):
         return f"""
         <domain>
           <devices>
-            <interface>
+            <interface type="{self.interface_type}">
               <target dev="tap22222222-22"/>
               <virtualport><parameters interfaceid="{PORT_UUID}"/></virtualport>
             </interface>
@@ -128,6 +130,14 @@ class CollectorTest(unittest.TestCase):
         self.assertIsNone(batch.disks[0].physical_bytes)
         collector.close()
         self.assertTrue(connection.closed)
+
+        # type='ethernet' taps report host-side counters; agent swaps them.
+        collector = ovn_agent.LibvirtCollector(args, FakeOVSDB())
+        with mock.patch.object(FakeDomain, "interface_type", "ethernet"), mock.patch.dict(
+            sys.modules, {"libvirt": fake_libvirt}
+        ):
+            batch = collector.read()
+        self.assertEqual((400, 300), (batch.vnics[0].rx, batch.vnics[0].tx))
 
     def test_network_only_requests_interface_stats(self):
         connection = FakeConnection(

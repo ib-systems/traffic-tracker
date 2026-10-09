@@ -713,6 +713,9 @@ class LibvirtCollector:
         self.args = args
         self.ovsdb = ovsdb
         self.port_ids: dict[tuple[str, str], str] = {}
+        # type='ethernet' taps: libvirt reports host-side counters, so rx/tx
+        # are the reverse of the guest's view and must be swapped.
+        self.host_view: set[tuple[str, str]] = set()
         self.connection: Any = None
         self._reconnecting = False
 
@@ -883,7 +886,9 @@ class LibvirtCollector:
                 key = (instance_uuid, interface_name)
                 if key in self.port_ids:
                     continue
-                self.port_ids.update(self._port_ids_from_xml(domain, instance_uuid, libvirt))
+                port_ids, host_view = self._port_ids_from_xml(domain, instance_uuid, libvirt)
+                self.port_ids.update(port_ids)
+                self.host_view.update(host_view)
 
             unresolved = {
                 (instance_uuid, interface_name)
@@ -900,12 +905,15 @@ class LibvirtCollector:
             self.port_ids = {
                 key: port_uuid for key, port_uuid in self.port_ids.items() if key in active_keys
             }
+            self.host_view &= active_keys
             samples: list[VNICSample] = []
             for _, instance_uuid, interface_name, rx, tx in pending:
                 port_uuid = self.port_ids.get((instance_uuid, interface_name))
                 if port_uuid is None:
                     LOG.debug("no Neutron port UUID for libvirt interface %s", interface_name)
                     continue
+                if (instance_uuid, interface_name) in self.host_view:
+                    rx, tx = tx, rx
                 samples.append(VNICSample(instance_uuid, interface_name, port_uuid, rx, tx))
             return CollectionBatch(vnics=samples, instances=instances, disks=disks)
         except libvirt.libvirtError as err:
@@ -940,22 +948,27 @@ class LibvirtCollector:
             )
 
     @staticmethod
-    def _port_ids_from_xml(domain: Any, instance_uuid: str, libvirt: Any) -> dict[tuple[str, str], str]:
+    def _port_ids_from_xml(
+        domain: Any, instance_uuid: str, libvirt: Any
+    ) -> tuple[dict[tuple[str, str], str], set[tuple[str, str]]]:
         try:
             tree = ET.fromstring(domain.XMLDesc(0))
         except (ET.ParseError, libvirt.libvirtError) as err:
             LOG.warning("cannot read XML for domain %s: %s", instance_uuid, err)
-            return {}
+            return {}, set()
         port_ids: dict[tuple[str, str], str] = {}
+        host_view: set[tuple[str, str]] = set()
         for iface in tree.findall("devices/interface"):
             target = iface.find("target")
             interface_name = target.get("dev") if target is not None else None
+            if interface_name and iface.get("type") == "ethernet":
+                host_view.add((instance_uuid, interface_name))
             params = iface.find("virtualport/parameters")
             interface_id = params.get("interfaceid") if params is not None else None
             port_uuid = as_uuid(interface_id)
             if interface_name and port_uuid:
                 port_ids[(instance_uuid, interface_name)] = port_uuid
-        return port_ids
+        return port_ids, host_view
 
 
 def run_cycle(
