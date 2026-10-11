@@ -120,6 +120,36 @@ WHERE ts >= cur_hour - INTERVAL 3 HOUR AND ts < cur_hour
 GROUP BY hour, region_name, instance_uuid, port_uuid, network_uuid;
 
 -- ============================================================
+-- 2c. Current-month network volume per instance (billing sync).
+--     Not APPEND: each refresh atomically replaces the table, so
+--     readers need no FINAL. Readers must filter on month: until
+--     the first refresh of a new month it still holds the old one.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS port_volume_month
+(
+    month         Date,
+    instance_uuid UUID,
+    rx_bytes      UInt64,
+    tx_bytes      UInt64,
+    fresh_as_of   DateTime
+)
+ENGINE = MergeTree
+ORDER BY instance_uuid;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS port_volume_month_mv
+REFRESH EVERY 1 HOUR OFFSET 15 MINUTE TO port_volume_month AS
+WITH toStartOfMonth(now('UTC')) AS m
+SELECT
+    m AS month,
+    instance_uuid,
+    sum(rx_bytes) AS rx_bytes,
+    sum(tx_bytes) AS tx_bytes,
+    max(hour) + INTERVAL 1 HOUR AS fresh_as_of
+FROM port_volume_hourly FINAL
+WHERE hour >= toDateTime(m, 'UTC')
+GROUP BY instance_uuid;
+
+-- ============================================================
 -- 3. Period-to-date usage view.
 -- ============================================================
 CREATE OR REPLACE VIEW port_usage AS
